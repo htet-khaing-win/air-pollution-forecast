@@ -27,4 +27,6 @@ mlartifacts/
 .DS_Store
 Thumbs.db
 
-*.json
+*.json.gitignore.bak 
+mlflow.db 
+temp_task.txt 
