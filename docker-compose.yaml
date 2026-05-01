@@ -1,0 +1,203 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# docker-compose.yaml
+#
+# SENSITIVE VALUES: All credentials and secrets are injected from .env
+# via ${VARIABLE_NAME} substitution. No hardcoded passwords or keys.
+# Copy .env.example → .env and fill in real values before running.
+#
+# SERVICES:
+#   postgres       — Airflow metadata DB
+#   airflow-init   — One-time DB migration + admin user creation
+#   webserver      — Airflow UI on :8080
+#   scheduler      — Airflow task runner + MLflow server (co-located on :5000)
+#   api            — FastAPI inference service on :8000
+#
+# NETWORK:
+#   airflow_net (bridge) — all services share this network for DNS resolution.
+#   The API connects to MLflow via http://scheduler:5000 — the scheduler
+#   service name resolves reliably because both are on airflow_net.
+#
+# MLflow co-location rationale:
+#   MLflow runs inside the scheduler container to eliminate cross-container
+#   DNS failures on Docker Desktop for Windows (see handover doc Section 4.2).
+#   Airflow tasks use http://localhost:5000 (same container, no DNS needed).
+#   The FastAPI service uses http://scheduler:5000 (cross-container, but
+#   reliable because it's a single lookup at startup, not in subprocesses).
+# ──────────────────────────────────────────────────────────────────────────────
+
+networks:
+  airflow_net:
+    driver: bridge
+
+# ── Shared Airflow config ─────────────────────────────────────────────────────
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: UTC
+    # Credentials from .env — no hardcoded values
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY}
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+    # MLflow: localhost because it runs inside the scheduler container.
+    # Airflow task subprocesses connect to localhost — no DNS lookup required.
+    MLFLOW_TRACKING_URI: http://localhost:5000
+    MLFLOW_MODEL_NAME: ${MLFLOW_MODEL_NAME}
+    # FIX 1: MLFLOW_SERVER_ALLOWED_HOSTS moved here (map format) so it
+    # merges with the base env instead of replacing it.
+    MLFLOW_SERVER_ALLOWED_HOSTS: "*"
+    PYTHONPATH: /opt/airflow
+    OPENAQ_API_KEY: ${OPENAQ_API_KEY}
+    OWM_API_KEY: ${OWM_API_KEY}
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+  volumes:
+    - ./src:/opt/airflow/src
+    - ./config:/opt/airflow/config
+    - ./dags:/opt/airflow/dags
+    - ./data:/opt/airflow/data
+    - mlruns_data:/opt/airflow/mlruns
+  networks:
+    - airflow_net
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - airflow_net
+    restart: unless-stopped
+
+  # ── Airflow init ─────────────────────────────────────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username ${AIRFLOW_ADMIN_USERNAME} \
+          --password ${AIRFLOW_ADMIN_PASSWORD} \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com
+        echo "Airflow initialised"
+    restart: on-failure
+
+  # ── Airflow webserver ────────────────────────────────────────────────────────
+  webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── Airflow scheduler + MLflow (co-located) ───────────────────────────────────
+  scheduler:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/mlruns/artifacts
+        MLFLOW_SERVER_ALLOWED_HOSTS="*" mlflow server \
+          --host 0.0.0.0 \
+          --port 5000 \
+          --backend-store-uri sqlite:////opt/airflow/mlruns/mlflow.db \
+          --default-artifact-root mlflow-artifacts:/artifacts \
+          --serve-artifacts \
+          --artifacts-destination /opt/airflow/mlruns/artifacts \
+          &
+        echo "Waiting for MLflow to be ready..."
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+          curl -sf http://localhost:5000 > /dev/null && echo "MLflow ready" && break
+          sleep 2
+        done
+        exec airflow scheduler
+    ports:
+      - "5000:5000"
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ── FastAPI inference service ─────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    env_file:
+      - .env
+    environment:
+      # Override MLflow URI — the API uses the scheduler service name, not localhost
+      MLFLOW_TRACKING_URI: http://scheduler:5000
+      MLFLOW_MODEL_NAME: ${MLFLOW_MODEL_NAME}
+      # Download model artifacts via HTTP proxy instead of direct filesystem access
+      MLFLOW_ARTIFACT_URI: http://scheduler:5000
+      MLFLOW_ENABLE_PROXY_MULTIPART_UPLOAD: "true"
+      PYTHONPATH: /app
+      # BYPASS SYSTEM PROXIES FOR INTERNAL NETWORKING
+      no_proxy: scheduler,postgres,localhost,127.0.0.1
+      NO_PROXY: scheduler,postgres,localhost,127.0.0.1
+    volumes:
+      - ./src:/app/src
+      - ./config:/app/config
+      - ./data:/app/data
+    ports:
+      - "8000:8000"
+    networks:
+      - airflow_net
+    depends_on:
+      scheduler:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: on-failure
+
+volumes:
+  postgres_data:
+  mlruns_data:

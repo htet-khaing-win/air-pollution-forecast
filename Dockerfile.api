@@ -1,0 +1,68 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Dockerfile.api — Multi-stage FastAPI inference service
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Stage 1: Builder ──────────────────────────────────────────────────────────
+FROM python:3.11-slim AS builder
+WORKDIR /app
+
+# System build deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create venv at /app/venv
+RUN python -m venv /app/venv
+ENV PATH="/app/venv/bin:$PATH"
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir fastapi uvicorn[standard]
+
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
+FROM python:3.11-slim AS runtime
+WORKDIR /app
+
+# !! libgomp1 must be installed in the runtime stage too —
+# system libraries are NOT copied from the builder stage automatically.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 1. Create the user and data directories (as root)
+RUN useradd --uid 1000 --no-create-home appuser && \
+    mkdir -p /app/data/raw /app/data/processed /app/mlruns && \
+    chown -R appuser:appuser /app/data /app/mlruns
+
+# 2. Copy the venv with matching paths and ownership
+COPY --from=builder --chown=appuser:appuser /app/venv /app/venv
+ENV PATH="/app/venv/bin:$PATH"
+
+# 3. Copy project source
+COPY --chown=appuser:appuser src/    /app/src/
+COPY --chown=appuser:appuser config/ /app/config/
+
+# 4. Environment Variables
+ENV PYTHONPATH="/app" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 8000
+
+# 5. Switch to non-root user
+USER appuser
+
+# Health check
+HEALTHCHECK --interval=15s --timeout=5s --retries=10 --start-period=60s \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+
+# 6. Use 'python -m uvicorn' to avoid shebang/path issues
+CMD ["python", "-m", "uvicorn", "src.inference.app:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--workers", "1", \
+     "--log-level", "info"]

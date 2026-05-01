@@ -1,0 +1,110 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# A/B Test Configuration — PM2.5 Forecasting Model Comparison
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# All 5 models are evaluated on the same time-based train/test split
+# so metrics are directly comparable. Results are logged to MLflow under
+# the experiment name defined below.
+#
+# HOW TO ENABLE / DISABLE A MODEL:
+#   Set `enabled: false` to skip a model without deleting its config.
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+experiment:
+  mlflow_experiment_name: "pm25_ab_test"
+  test_size: 0.2                  # time-based split — last 20% is test set
+  target_col: "pm25"
+  drop_cols:                      # always-NaN columns for Yangon
+    - pm10
+    - co
+    - no2
+    - o3
+  non_feature_cols:               # excluded from feature matrix
+    - timestamp
+    - pm25
+    - aqi_category
+    - aqi_numeric
+    - pm25_owm_delta              # algebraically contains pm25 — leaks target
+
+# ── Walk-forward cross-validation ─────────────────────────────────────────────
+cross_validation:
+  n_folds: 5
+  min_train_size: 0.5             # first fold trains on at least 50% of training data
+
+# ──────────────────────────────────────────────────────────────────────────────
+models:
+
+  # 1. XGBoost — gradient boosted trees with lag/rolling features
+  #    Your current Phase 3 model. Tightened params to reduce overfitting.
+  - name: "xgboost"
+    enabled: true
+    type: "xgboost"
+    params:
+      n_estimators: 200
+      learning_rate: 0.05
+      max_depth: 4
+      subsample: 0.7
+      colsample_bytree: 0.7
+      min_child_weight: 10
+      reg_alpha: 0.5
+      reg_lambda: 2.0
+      random_state: 42
+      n_jobs: -1
+      tree_method: "hist"
+      early_stopping_rounds: 30
+
+  # 2. LightGBM — gradient boosted trees, often faster and better on small data
+  #    Direct competitor to XGBoost. Uses leaf-wise growth vs level-wise.
+  - name: "lightgbm"
+    enabled: true
+    type: "lightgbm"
+    params:
+      n_estimators: 200
+      learning_rate: 0.05
+      max_depth: 4
+      num_leaves: 15              # 2^max_depth - 1 is a safe ceiling
+      subsample: 0.7
+      colsample_bytree: 0.7
+      min_child_samples: 20       # equivalent to min_child_weight in XGBoost
+      reg_alpha: 0.5
+      reg_lambda: 2.0
+      random_state: 42
+      n_jobs: -1
+      early_stopping_rounds: 30
+      verbose: -1                 # suppress LightGBM console output
+
+  # 3. Ridge Regression — linear model with L2 regularisation
+
+  - name: "ridge"
+    enabled: true
+    type: "ridge"
+    params:
+      alpha: 1.0                  # L2 regularisation strength
+      fit_intercept: true
+
+  # 4. Prophet — Facebook's additive time series model
+
+  - name: "prophet"
+    enabled: true
+    type: "prophet"
+    params:
+      yearly_seasonality: true
+      weekly_seasonality: true
+      daily_seasonality: true
+      seasonality_mode: "multiplicative"  # better for data with proportional spikes
+      changepoint_prior_scale: 0.05       # flexibility of trend changepoints
+      seasonality_prior_scale: 10.0
+      interval_width: 0.95
+
+  # 5. Chronos — Amazon's pretrained foundation model for time series
+
+  - name: "chronos"
+    enabled: true
+    type: "chronos"
+    params:
+      model_id: "amazon/chronos-t5-small"   # options: tiny/mini/small/base/large
+      device: "cpu"                          # change to "cuda" if GPU available
+      torch_dtype: "bfloat16"               # memory-efficient; use "float32" if issues
+      prediction_length: 24                  # forecast horizon in hours
+      num_samples: 20                        # probabilistic samples (more = slower)
